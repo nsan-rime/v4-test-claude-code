@@ -9,10 +9,11 @@ import numpy as np
 import torch.distributed as dist
 
 from pathlib import Path
+from qwen_tts import Qwen3TTSTokenizer
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.trainer_utils import set_seed
 
 # Make all imports below relative to root (where .rv-root is)
@@ -72,7 +73,7 @@ class CSMDepthDecoder(nn.Module):
         csm_backbone_dim=2048,
         # Rime depth decoder
         qwen_backbone_dim=1536,
-        rime_num_codebooks=12
+        rime_num_codebooks=16
     ):
         super().__init__()
 
@@ -88,36 +89,29 @@ class CSMDepthDecoder(nn.Module):
         self.codebook0_head = nn.Linear(csm_backbone_dim, csm_audio_vocab_size, bias=False)
         self.audio_head = nn.Parameter(torch.empty(csm_audio_num_codebooks - 1, decoder_dim, 2051))
 
-        # Load relevant pre-trained weights
-        cp = torch.load("/workspace/tmp/v4-crash-course/csm-depth-decoder-weights.pt", map_location='cpu')
-        self.load_state_dict(cp)
-
         # Random init projection from Qwen hidden dim to CSM embedding dim
         self.qwenH_to_csmH = nn.Linear(qwen_backbone_dim, csm_backbone_dim, bias=False)
 
-    def set_csm_trainable(self, trainable: bool):
-        
-        for module in [ self.decoder, self.audio_embeddings, self.projection, self.codebook0_head ]:
-            for p in module.parameters():
-                p.requires_grad = trainable
-
-        # Parameter: audio_head
-        self.audio_head.requires_grad = trainable
+        # Seperate projection to transformer 1536-dim Qwen Codebook 0 embeddings to match Codebook 1+ embeddings
+        self.qwenC0_to_csmC0 = nn.Linear(qwen_backbone_dim, csm_backbone_dim, bias=False)
     
-    def forward(self, backbone_hidden_states, mimi_targets):
+    def forward(self, backbone_hidden_states, backbone_codebook0_embeddings, qwen16_targets):
         
-        # Case in case backbone_hidden_states in bfloat16
-        backbone_hidden_states = backbone_hidden_states.to(
-            dtype=self.qwenH_to_csmH.weight.dtype # 
-        )
+        # Case in case backbone weights/outputs are in bfloat16
 
         # Up-project Qwen to match CSM hidden states [B, 1, 1536] -> [B, 1, 2048]
+        backbone_hidden_states = backbone_hidden_states.to(dtype=self.qwenH_to_csmH.weight.dtype)
         csmH = self.qwenH_to_csmH(backbone_hidden_states)
 
-        # Input embeds: [B, C, 2048] from [B, 1, 2048] prefix onto [B, C-1, 2048] (all but last codebook)
+        # Up-project Qwen Codebook 0 embeddings to match pre-trained CSM Codebook 1+ embeddings
+        backbone_codebook0_embeddings = backbone_codebook0_embeddings.to(dtype=self.qwenC0_to_csmC0.weight.dtype)
+        csmC0 = self.qwenC0_to_csmC0(backbone_codebook0_embeddings)
+
+        # Input embeds: [ H ] + [ C0 ] + [ C1 ... Cn-1 ]
         input_embeds = torch.cat(
             [ csmH ] + 
-            [ self.audio_embeddings(mimi_targets[:, i-1] + ((i-1) * self.csm_audio_vocab_size)).unsqueeze(1) for i in range(1, self.rime_num_codebooks) ],
+            [ csmC0 ] +
+            [ self.audio_embeddings(qwen16_targets[:, i-1] + ((i-1) * self.csm_audio_vocab_size)).unsqueeze(1) for i in range(2, self.rime_num_codebooks) ],
             dim=1
         )
 
@@ -134,7 +128,7 @@ class CSMDepthDecoder(nn.Module):
 
         loss = torch.nn.functional.cross_entropy(
             logits_stacked.reshape(-1, self.csm_audio_vocab_size), # (B*C, V)
-            mimi_targets.reshape(-1),                              # (B*C,)
+            qwen16_targets.reshape(-1),                              # (B*C,)
             reduction="mean"
         )
 
@@ -157,23 +151,83 @@ class DualDecoder(torch.nn.Module):
         # Subset frames from hidden states (one long packed sequence)
         backbone_hidden_state = backbone_outputs.hidden_states[-1][:, batch['indices_for_backbone_output'], :].transpose(0, 1) # [B, 1, H]
 
+        # Look up bacbkone's codebook0 embeddings to pass to depth decoder
+        backbone_codebook0_embeddings = self.backbone.get_input_embeddings()((batch['qwen16_targets'][:,0] + 151_675).cuda()).unsqueeze(1)
+
         # Decoder forward 
         decoder_loss = self.decoder(
             backbone_hidden_state,
-            batch['mimi_targets'].to(self.device)
+            backbone_codebook0_embeddings,
+            batch['qwen16_targets'].to(self.device)
         )
 
-        # Should this be weighted?
-        total_loss = backbone_loss + decoder_loss
+        return backbone_loss, decoder_loss
 
-        # For logging 
-        loss_dict = {
-            "loss/total" : total_loss.item(),
-            "loss/backbone" : backbone_loss.item(),
-            "loss/decoder" : decoder_loss.item()
-        }
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids,
+        backbone_max_tokens=1000,
+        backbone_temp=0.5,
+        backbone_top_p=1.0,
+        bacbkone_rep_pen=1.1,
+        depth_topk=32,
+        depth_temp=0.1
+    ):
+        
+        backbone_outputs = self.backbone.generate(
+            input_ids=input_ids.cuda(),
+            attention_mask=torch.ones_like(input_ids).cuda(),
+            max_new_tokens=backbone_max_tokens,
+            do_sample=True,
+            temperature=backbone_temp,
+            top_p=backbone_top_p,
+            repetition_penalty=bacbkone_rep_pen,
+            num_return_sequences=1,
+            eos_token_id=151_667,
+            return_dict_in_generate=True,
+            output_hidden_states=True
+        )
 
-        return total_loss, loss_dict
+        last_layer_hidden_states = [ all_layers_hidden_states[-1] for all_layers_hidden_states in backbone_outputs.hidden_states[:-1] ]
+
+        generated_frames = []
+        
+        for t in range(len(last_layer_hidden_states)):
+        
+            backbone_hidden_states=last_layer_hidden_states[t][:, -1, :]
+            
+            backbone_hidden_states = backbone_hidden_states.to(
+                dtype=self.decoder.qwenH_to_csmH.weight.dtype
+            )
+            
+            with torch.no_grad():
+                csmH = self.decoder.qwenH_to_csmH(backbone_hidden_states)
+                
+                c0_logits = self.decoder.codebook0_head(csmH)
+                c0_sample = sample_topk(c0_logits, depth_topk, depth_temp)
+                
+                c0_qwen_embed = self.backbone.get_input_embeddings()(c0_sample + 151_675)
+                c0_csm_embed  = self.decoder.qwenC0_to_csmC0(c0_qwen_embed.to(dtype=self.decoder.qwenC0_to_csmC0.weight.dtype))
+            
+                curr_h = torch.cat([ csmH.unsqueeze(1), c0_csm_embed ], dim=1)
+                curr_sample = c0_sample.clone()
+            
+                for i in range(1, self.decoder.rime_num_codebooks):
+                    decoder_h = self.decoder.decoder(self.decoder.projection(curr_h))
+                    
+                    ci_logits = torch.mm(decoder_h[:, -1, :], self.decoder.audio_head[i - 1])
+                    ci_sample = sample_topk(ci_logits, depth_topk, depth_temp)
+                    ci_embed = self.decoder.audio_embeddings(ci_sample + i*2051)
+            
+                    curr_h = torch.cat([curr_h, ci_embed], dim=1)
+                    curr_sample = torch.cat([curr_sample, ci_sample], dim=1)
+                    
+            generated_frames.append(curr_sample)
+
+        qwen16_codes = torch.stack(generated_frames, dim=-1).cpu().squeeze(0).T
+
+        return qwen16_codes
 
 # Data collator
 
@@ -195,27 +249,41 @@ def collate_for_dual_decoder(data):
         "position_ids" : torch.LongTensor(position_ids).unsqueeze(0)
     }
 
-    mimi_seq_lengths = [ d.shape[1] for d in packed_example['mimi_24khz_tokens'] ]
-    mimi_frames_to_sample = [ np.random.randint(0, s, min(16, s)) for s in mimi_seq_lengths ]
+    qwen16_seq_lengths = [ d.shape[0] for d in packed_example['qwen_24khz_tokens'] ]
+    qwen16_frames_to_sample = [ np.random.choice(s, size=min(16, s), replace=False) for s in qwen16_seq_lengths ]
 
     first_speech_token_indices = np.where(input_ids==151_666)[0] + 1
 
-    indices_for_backbone_output = np.concatenate([ indices + offset for (offset, indices) in zip(first_speech_token_indices, mimi_frames_to_sample) ]).astype(np.int64)
+    indices_for_backbone_output = np.concatenate([ indices + offset for (offset, indices) in zip(first_speech_token_indices, qwen16_frames_to_sample) ]).astype(np.int64)
 
-    mimi_targets = torch.cat([
-        torch.LongTensor(seq_all_frames[:, indices_to_sample].T)
+    qwen16_targets = torch.cat([
+        torch.LongTensor(seq_all_frames[indices_to_sample, :])
         for (seq_all_frames, indices_to_sample) in
-        zip(packed_example['mimi_24khz_tokens'], mimi_frames_to_sample)
+        zip(packed_example['qwen_24khz_tokens'], qwen16_frames_to_sample)
     ])
 
     return {
         "_ids" : [ str(id) for id in data[0]['_ids'] ], # Return IDs for debugging/logging 
         "backbone_inputs" : backbone_inputs,
         "indices_for_backbone_output" : indices_for_backbone_output,
-        "mimi_targets" : mimi_targets
+        "qwen16_targets" : qwen16_targets
     }
 
 # Helpers
+
+def get_loss_weights(global_step, total_steps):
+    """
+    Linearly go from:
+       For first third of training: backbone weight 1.0, decoder weight 0.1
+       For second third of training: backbone weight: 0.5, decoder weight: 1.0
+       For final third of training: backbone weight: 0.1, decoder weight: 1.0
+    """
+    if global_step < total_steps // 3:
+        return 1.0, 0.1
+    elif global_step < 2 * total_steps // 3:
+        return 0.5, 1.0
+    else:
+        return 0.1, 1.0
 
 def save_checkpoint(model, global_step, checkpoint_dir, metadata=None):
     write_path = f"{checkpoint_dir}/checkpoint_{global_step}"
@@ -227,17 +295,59 @@ def move_batch_to_device(batch, device="cuda"):
     # Move keys that don't start with '_' (e.g. '_ids')
     return { k:v.to(device) for (k,v) in batch.items() if not k.startswith('_') }
 
+def prepare_input_ids(text):
+    start_of_text      = 151644 # <|im_start|>
+    end_of_text        = 151645 # <|im_end|>
+    tokeniser_length   = 151665
+    start_of_speech    = tokeniser_length + 1
+    end_of_speech      = tokeniser_length + 2
+    system_token_id    = 8948 # system
+    assistant_token_id = 77091 # assistant
+    newline_token_id   = 198
+
+    text_tokens = qwen_text_tokenizer.encode(text, add_special_tokens=False)
+
+    # Qwen chat format
+    input_ids = torch.LongTensor([(
+        [start_of_text] + [system_token_id, newline_token_id] + text_tokens + [end_of_text, newline_token_id] +
+        [start_of_text] + [assistant_token_id, newline_token_id, start_of_speech]
+    )])
+
+    return input_ids
+
+def _multinomial_sample_one_no_sync(probs):  # Does multinomial sampling without a cuda synchronization
+    q = torch.empty_like(probs).exponential_(1)
+    return torch.argmax(probs / q, dim=-1, keepdim=True).to(dtype=torch.int)
+
+def sample_topk(logits: torch.Tensor, topk: int, temperature: float):
+    logits = logits / temperature
+
+    filter_value: float = -float("Inf")
+    indices_to_remove = logits < torch.topk(logits, topk)[0][..., -1, None]
+    scores_processed = logits.masked_fill(indices_to_remove, filter_value)
+    scores_processed = torch.nn.functional.log_softmax(scores_processed, dim=-1)
+    probs = torch.nn.functional.softmax(scores_processed, dim=-1)
+
+    sample_token = _multinomial_sample_one_no_sync(probs)
+    return sample_token
+
+def decode_audio(qwen_codes_cpu):
+    audio_samples, audio_sr = qwen_audio_tokenizer.decode({ "audio_codes" : qwen_codes_cpu })
+    return audio_samples[0]
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('run_name')
     parser.add_argument('train_dataset')
-    parser.add_argument('--epochs', type=int, default=4)
-    parser.add_argument('--csm-freeze-steps', type=int, default=500)
-    parser.add_argument('--checkpoint-interval', type=int, default=4000)
+    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--checkpoint-interval', type=int, default=10000)
     parser.add_argument('--log-interval', type=int, default=100)
     parser.add_argument('--grad-acc-steps', type=int, default=1)
-    parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--audio-gen-interval', type=int, default=2500)
+    parser.add_argument('--lr', type=float, default=2e-4)
+    parser.add_argument('--lr-schedule-total-steps', type=int, default=None, help='Total steps for LR schedule (use full dataset value for consistent LR trajectory)')
+
     args = parser.parse_args()
 
     set_seed(0)
@@ -262,10 +372,9 @@ if __name__ == "__main__":
         dist.init_process_group(backend='nccl', init_method='env://')
 
     model = DualDecoder(device=device)
-    model.decoder.set_csm_trainable(False)
 
     if GLOBAL_WORLD_SIZE > 1:
-        model = DDP(model, device_ids=[ LOCAL_RANK ], find_unused_parameters=True)
+        model = DDP(model, device_ids=[ LOCAL_RANK ])
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -276,11 +385,15 @@ if __name__ == "__main__":
         fused=True
     )
 
+    # Use reference steps for LR schedule if provided, otherwise use actual steps
+    # Used for when using a smaller dev dataset but keeping LR schedule same as full run
+    LR_SCHEDULE_TOTAL_STEPS = args.lr_schedule_total_steps or NUM_UPDATE_STEPS
+
     scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer,
         start_factor=1.0,
         end_factor=0.0,
-        total_iters=NUM_UPDATE_STEPS
+        total_iters=LR_SCHEDULE_TOTAL_STEPS
     )
 
     dataloader = DataLoader(
@@ -298,11 +411,11 @@ if __name__ == "__main__":
             name = args.run_name
         )
 
-    for global_step in range(NUM_UPDATE_STEPS):
+        # Only run infer on rank 0
+        qwen_text_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
+        qwen_audio_tokenizer = Qwen3TTSTokenizer.from_pretrained("Qwen/Qwen3-TTS-Tokenizer-12Hz", device_map="cuda")
 
-        if global_step == args.csm_freeze_steps:
-            print("Unfreezing CSM weights...")
-            model.module.decoder.set_csm_trainable(True) if GLOBAL_WORLD_SIZE > 1 else model.decoder.set_csm_trainable(True)
+    for global_step in range(NUM_UPDATE_STEPS):
 
         optimizer.zero_grad()
         loss_accum = 0.0
@@ -316,8 +429,20 @@ if __name__ == "__main__":
                 dliter = iter(dataloader)
                 batch = next(dliter)
 
-            loss, loss_dict = model(batch)
-        
+            backbone_loss, decoder_loss = model(batch)
+            backbone_loss_weight, decoder_loss_weight = 1.0, 1.0 # Turn off loss weighting for now
+
+            backbone_loss *= backbone_loss_weight
+            decoder_loss  *= decoder_loss_weight
+
+            loss = backbone_loss + decoder_loss
+
+            loss_dict = {
+                "loss/total": loss.item(),
+                "loss/backbone": backbone_loss.item(),
+                "loss/decoder": decoder_loss.item()
+            }
+
             loss = loss / args.grad_acc_steps
             loss_accum += loss.detach()
             loss.backward()
@@ -340,13 +465,38 @@ if __name__ == "__main__":
 
         if GLOBAL_RANK == 0:
 
+            model_ref = model.module if GLOBAL_WORLD_SIZE > 1 else model
+
             if global_step % args.log_interval == 0:
                 wandb.log(metrics)
                 print(metrics)
 
             if global_step > 0 and (global_step % args.checkpoint_interval == 0 or global_step == NUM_UPDATE_STEPS - 1):
                 # save model
-                save_checkpoint(model.module if GLOBAL_WORLD_SIZE > 1 else model, global_step, CHECKPOINT_DIR, metadata={ "wandb_run_id":wandb_run.id })
+                save_checkpoint(model_ref, global_step, CHECKPOINT_DIR, metadata={ "wandb_run_id":wandb_run.id })
+
+            if global_step > 0 and args.audio_gen_interval > 0 and (global_step % args.audio_gen_interval == 0 or global_step == NUM_UPDATE_STEPS - 1):
+
+                print("Generating audio...")
+
+                model_ref.eval()
+
+                prompts = [
+                    '{ Grover Gardner }:  I am a speech generation model that can sound like a real person.'
+                ]
+
+                sample_audios_table = wandb.Table(columns=["Text", "Audio"])
+
+                for p in prompts:
+                    input_ids = prepare_input_ids(p)
+                    qwen16_codes = model_ref.generate(input_ids)
+                    reconstructed_audio = decode_audio(qwen16_codes)
+
+                    sample_audios_table.add_data(p, wandb.Audio(reconstructed_audio, sample_rate=24_000))
+
+                wandb.log({"sample_audios_table": sample_audios_table})
+
+                model_ref.train()
 
     if GLOBAL_WORLD_SIZE > 1:
         dist.destroy_process_group()
